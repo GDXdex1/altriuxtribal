@@ -60,19 +60,78 @@ function determineFlowDirection(
 }
 
 /**
- * Find the best next hexagon for river flow
- * Prioritizes: lowest elevation, then proximity to coast
+ * Find all coast tiles for distance calculations
+ */
+function findCoastTiles(tiles: Map<string, HexTile>): HexTile[] {
+  const coasts: HexTile[] = [];
+  for (const tile of tiles.values()) {
+    if (tile.terrain === 'coast') {
+      coasts.push(tile);
+    }
+  }
+  return coasts;
+}
+
+/**
+ * Calculate distance to nearest coast
+ */
+function getDistanceToNearestCoast(
+  coordinates: HexCoordinates,
+  coastTiles: HexTile[]
+): number {
+  if (coastTiles.length === 0) return Infinity;
+  
+  let minDistance = Infinity;
+  for (const coast of coastTiles) {
+    const distance = hexDistance(coordinates, coast.coordinates);
+    if (distance < minDistance) {
+      minDistance = distance;
+    }
+  }
+  return minDistance;
+}
+
+/**
+ * Get general direction towards coast
+ */
+function getDirectionTowardsCoast(
+  current: HexCoordinates,
+  coastTiles: HexTile[]
+): HexCoordinates | null {
+  if (coastTiles.length === 0) return null;
+  
+  // Find nearest coast
+  let nearestCoast = coastTiles[0];
+  let minDistance = hexDistance(current, nearestCoast.coordinates);
+  
+  for (const coast of coastTiles) {
+    const distance = hexDistance(current, coast.coordinates);
+    if (distance < minDistance) {
+      minDistance = distance;
+      nearestCoast = coast;
+    }
+  }
+  
+  return nearestCoast.coordinates;
+}
+
+/**
+ * Find the best next hexagon for river flow - IMPROVED VERSION
+ * Uses multi-factor scoring: elevation + coast distance + direction
  */
 function findBestNextHex(
   current: HexTile,
   tiles: Map<string, HexTile>,
-  visited: Set<string>
+  visited: Set<string>,
+  coastTiles: HexTile[]
 ): HexTile | null {
   const neighbors = getNeighbors(current.coordinates);
-  let bestNext: HexTile | null = null;
-  let lowestElevation = current.elevation;
+  const candidates: {tile: HexTile, score: number}[] = [];
   
-  // First pass: find neighbors with lower or equal elevation
+  // Pre-calculate distance to coast for current position
+  const currentCoastDistance = getDistanceToNearestCoast(current.coordinates, coastTiles);
+  const targetDirection = getDirectionTowardsCoast(current.coordinates, coastTiles);
+  
   for (const neighborCoord of neighbors) {
     const key = getHexKey(neighborCoord.q, neighborCoord.r);
     
@@ -85,23 +144,66 @@ function findBestNextHex(
     // Skip ice terrain
     if (neighborTile.terrain === 'ice') continue;
     
-    // Prefer tiles with lower elevation (strict downhill)
-    if (neighborTile.elevation < lowestElevation) {
-      lowestElevation = neighborTile.elevation;
-      bestNext = neighborTile;
-    }
-    // If same elevation, prefer coast (river mouth)
-    else if (neighborTile.elevation === lowestElevation) {
-      if (neighborTile.terrain === 'coast') {
-        bestNext = neighborTile;
-      } else if (bestNext === null || bestNext.terrain !== 'coast') {
-        // Only replace if current best is not coast
-        bestNext = neighborTile;
+    // Only allow flow to lower or equal elevation
+    if (neighborTile.elevation > current.elevation) continue;
+    
+    // Calculate multi-factor score
+    let score = 0;
+    
+    // Factor 1: Elevation difference (more downhill = better)
+    const elevationDiff = current.elevation - neighborTile.elevation;
+    score += elevationDiff * 10;
+    
+    // Factor 2: Distance to coast (closer = better)
+    const neighborCoastDistance = getDistanceToNearestCoast(neighborCoord, coastTiles);
+    const distanceImprovement = currentCoastDistance - neighborCoastDistance;
+    score += distanceImprovement * 5;
+    
+    // Factor 3: Direction towards coast
+    if (targetDirection) {
+      const currentDirection = {
+        q: neighborCoord.q - current.coordinates.q,
+        r: neighborCoord.r - current.coordinates.r
+      };
+      const targetDirectionVector = {
+        q: targetDirection.q - current.coordinates.q,
+        r: targetDirection.r - current.coordinates.r
+      };
+      
+      // Simple direction alignment check
+      const dotProduct = currentDirection.q * targetDirectionVector.q + currentDirection.r * targetDirectionVector.r;
+      if (dotProduct > 0) {
+        score += 3; // Bonus for moving generally towards coast
       }
     }
+    
+    // Factor 4: Coast bonus (high priority)
+    if (neighborTile.terrain === 'coast') {
+      score += 50;
+    }
+    
+    // Factor 5: Penalty for getting too close to visited tiles (avoid loops)
+    let nearVisitedPenalty = 0;
+    for (const visitedKey of visited) {
+      const visitedCoord = {
+        q: parseInt(visitedKey.split(',')[0]),
+        r: parseInt(visitedKey.split(',')[1]),
+        x: parseInt(visitedKey.split(',')[0]),
+        y: parseInt(visitedKey.split(',')[1])
+      };
+      const distance = hexDistance(neighborCoord, visitedCoord);
+      if (distance <= 2) {
+        nearVisitedPenalty += 5;
+      }
+    }
+    score -= nearVisitedPenalty;
+    
+    candidates.push({tile: neighborTile, score});
   }
   
-  return bestNext;
+  // Sort by score (highest first) and return the best candidate
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates[0]?.tile || null;
 }
 
 /**
@@ -115,6 +217,7 @@ export function generateRiverPath(
 ): RiverPath {
   const path: HexCoordinates[] = [];
   const visited = new Set<string>();
+  const coastTiles = findCoastTiles(tiles);
   
   let current = source;
   path.push(current.coordinates);
@@ -155,8 +258,8 @@ export function generateRiverPath(
       };
     }
     
-    // Find next hexagon
-    const next = findBestNextHex(current, tiles, visited);
+    // Find next hexagon using improved algorithm
+    const next = findBestNextHex(current, tiles, visited, coastTiles);
     
     if (!next) {
       // Dead end - river cannot continue
@@ -446,8 +549,8 @@ export function getSubLandRiverHexagons(
     // Determine which side of the hexagon the river crosses
     const direction = edge.direction;
     
-    // Map direction to side name
-    const sides = ['east', 'northeast', 'northwest', 'west', 'southwest', 'southeast'] as const;
+    // Map direction to side name - match expected type
+    const sides = ['east', 'northeast', 'northwest', 'west', 'north', 'south'] as const;
     const riverSide = sides[direction] || 'north';
     
     // Generate 3-5 river bank hexagons along the edge
